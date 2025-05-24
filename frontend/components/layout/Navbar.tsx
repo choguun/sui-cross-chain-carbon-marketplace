@@ -10,7 +10,7 @@ const Navbar = () => {
           <Link href="/" className="mr-6 flex items-center space-x-2">
             {/* Placeholder for Logo */} 
             <span className="hidden font-bold sm:inline-block">
-              VCOMarketplace
+              Carbon Credit Marketplace
             </span>
           </Link>
           <nav className="flex items-center gap-4 text-sm lg:gap-6">
