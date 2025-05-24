@@ -4,12 +4,12 @@ module rwa_platform::marketplace {
     use sui::coin::{Self, Coin};
     use sui::sui::SUI;
     use sui::table::{Self, Table};
-    use sui::object::{Self, UID, ID};
-    use sui::transfer::{Self, public_share_object, public_transfer, share_object}; // Explicitly import used transfer functions
-    use sui::tx_context::{Self, TxContext};
+    use sui::object::{new, id, delete}; // UID and ID are default aliases
+    use sui::transfer::{public_share_object, public_transfer, share_object}; // Explicitly import used transfer functions
+    use sui::tx_context::sender; // TxContext type is a default alias
 
     // Standard library imports
-    use std::vector; // Explicitly import vector for clarity if used directly
+    // vector type and vector::functions are available by default
 
     // Import the NFT struct from the other module (already converted to Sui)
     use rwa_platform::carbon_nft_manager::{CarbonCreditNFT};
@@ -79,34 +79,34 @@ module rwa_platform::marketplace {
         price_mist: u64, // Asking price in MIST
         ctx: &mut TxContext
     ) {
-        let sender = tx_context::sender(ctx);
-        let nft_original_id = object::id(&nft); // Get NFT ID before it's moved
+        let sender_address = sender(ctx);
+        let nft_original_id = id(&nft); // Get NFT ID before it's moved
 
         // Create the Listing object, taking ownership of the NFT
         let listing = Listing {
-            id: object::new(ctx),
+            id: new(ctx),
             nft_id: nft_original_id,
             nft: nft, // NFT is moved into the listing here
             price_mist: price_mist,
-            seller: sender,
+            seller: sender_address,
         };
 
-        let listing_id = object::id(&listing);
+        let listing_id = id(&listing);
 
         // Add to registry
-        table::add(&mut registry.active_listings, listing_id, sender);
-        vector::push_back(&mut registry.active_listing_ids, listing_id);
+        table::add(&mut registry.active_listings, listing_id, sender_address);
+        std::vector::push_back(&mut registry.active_listing_ids, listing_id);
 
         // Emit event
         event::emit(ListingCreated {
             listing_id: listing_id,
             nft_id: nft_original_id,
-            seller: sender,
+            seller: sender_address,
             price_mist: price_mist,
         });
 
         // Share the Listing object so buyers can find it
-        transfer::public_share_object(listing);
+        public_share_object(listing);
     }
 
     /// Buy a listed item.
@@ -116,8 +116,8 @@ module rwa_platform::marketplace {
         payment: Coin<SUI>, // Payment coin (must be SUI)
         ctx: &mut TxContext
     ) {
-        let buyer = tx_context::sender(ctx);
-        let listing_obj_id = object::id(&listing); // Get listing ID before consuming
+        let buyer = sender(ctx);
+        let listing_obj_id = id(&listing); // Get listing ID before consuming
 
         // Check payment amount
         assert!(coin::value(&payment) == listing.price_mist, EIncorrectPaymentAmount);
@@ -134,9 +134,9 @@ module rwa_platform::marketplace {
         // Remove from registry *before* potential transfer failures
         let _removed_seller = table::remove(&mut registry.active_listings, listing_obj_id);
         // Remove listing ID from the vector
-        let (found_in_vec, index_in_vec) = vector::index_of(&registry.active_listing_ids, &listing_obj_id);
+        let (found_in_vec, index_in_vec) = std::vector::index_of(&registry.active_listing_ids, &listing_obj_id);
         if (found_in_vec) {
-            let _ = vector::swap_remove(&mut registry.active_listing_ids, index_in_vec);
+            let _ = std::vector::swap_remove(&mut registry.active_listing_ids, index_in_vec);
         }; // Explicitly terminate the if statement
 
         // Transfer NFT to buyer
@@ -155,7 +155,7 @@ module rwa_platform::marketplace {
         });
 
         // Explicitly delete the Listing object's UID
-        object::delete(listing_uid);
+        delete(listing_uid);
     }
 
     /// Cancel a listing and get the NFT back.
@@ -164,11 +164,11 @@ module rwa_platform::marketplace {
         listing: Listing, // Pass the Listing object by value
         ctx: &mut TxContext
     ) {
-        let sender = tx_context::sender(ctx);
-        let listing_obj_id = object::id(&listing); // Get listing ID before consuming
+        let sender_address = sender(ctx);
+        let listing_obj_id = id(&listing); // Get listing ID before consuming
 
         // Verify sender is the original seller before consuming the listing
-        assert!(sender == listing.seller, ENotSeller);
+        assert!(sender_address == listing.seller, ENotSeller);
 
         // Destructure the Listing object
         let Listing {
@@ -182,9 +182,9 @@ module rwa_platform::marketplace {
         // Remove from registry
         let _removed_seller = table::remove(&mut registry.active_listings, listing_obj_id);
         // Remove listing ID from the vector
-        let (found_in_vec, index_in_vec) = vector::index_of(&registry.active_listing_ids, &listing_obj_id);
+        let (found_in_vec, index_in_vec) = std::vector::index_of(&registry.active_listing_ids, &listing_obj_id);
         if (found_in_vec) {
-            let _ = vector::swap_remove(&mut registry.active_listing_ids, index_in_vec);
+            let _ = std::vector::swap_remove(&mut registry.active_listing_ids, index_in_vec);
         }; // Explicitly terminate the if statement
 
         // Transfer NFT back to seller
@@ -198,7 +198,7 @@ module rwa_platform::marketplace {
         });
 
          // Explicitly delete the Listing object's UID
-        object::delete(listing_uid);
+        delete(listing_uid);
     }
 
     // --- Initialization Function --- //
@@ -206,11 +206,11 @@ module rwa_platform::marketplace {
     /// Called once during package deployment. Creates and shares the ListingRegistry.
     fun init(ctx: &mut TxContext) {
         let registry = ListingRegistry {
-            id: object::new(ctx),
+            id: new(ctx),
             active_listings: table::new<ID, address>(ctx),
-            active_listing_ids: vector::empty<ID>() // Initialize empty vector
+            active_listing_ids: std::vector::empty<ID>() // Initialize empty vector
         };
-        transfer::share_object(registry); // Share the registry so it can be used
+        share_object(registry); // Share the registry so it can be used
     }
 
     // --- View Function --- //

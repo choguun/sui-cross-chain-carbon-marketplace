@@ -4,14 +4,23 @@ module rwa_platform::carbon_nft_manager {
     use sui::table::{Self, Table};
     use sui::display::{Self}; // For Display objects
     use sui::package::{Self, Publisher}; // For Publisher object
-    use sui::object::{Self, UID, ID};
-    use sui::transfer::{Self, transfer, public_transfer, share_object, public_share_object, freeze_object}; // Explicitly import transfer functions
-    use sui::tx_context::{Self, TxContext};
+    use sui::object::{new, id, uid_as_inner, delete}; // UID and ID are default aliases
+    use sui::transfer::{public_transfer, share_object, public_share_object, transfer, freeze_object}; // Specific imports
+    use sui::tx_context::{sender, epoch_timestamp_ms}; // TxContext type is a default alias
     use sui::event;
+    use sui::coin::{Self, TreasuryCap, Coin}; // Import Coin and TreasuryCap
+    use sui::sui::SUI;
 
     // Standard library imports
-    use std::string::{Self, String}; // Assuming UTF8 string from std
-    use std::vector;
+    use std::string; 
+    use std::option::{some, none, is_none, fill, is_some, borrow}; 
+
+    // Wormhole and Token Bridge imports
+    use wormhole::emitter::{EmitterCap}; 
+    use wormhole::publish_message::{publish_message, MessageTicket}; 
+    use wormhole::state as WormholeStateModule; // Alias for wormhole::state
+    use token_bridge::state as TokenBridgeStateModule; // Alias for token_bridge::state
+    // Unused token_bridge module imports removed, calls will be fully qualified or compiler will guide if needed
 
     /// Represents a unique, verified carbon credit tied to a specific event.
     public struct CarbonCreditNFT has key, store {
@@ -41,12 +50,23 @@ module rwa_platform::carbon_nft_manager {
         retirement_timestamp_ms: u64,
     }
 
+    /// Fungible token representing carbon credits, backed by retired NFTs.
+    public struct CarbonCreditToken has store, drop {}
+
     /// One-time witness for claiming the Publisher object.
     public struct CARBON_NFT_MANAGER has drop {}
 
-    /// Capability object granting minting authority. Held by the backend.
+    /// Capability object granting administrative authority and holding key resources.
     public struct AdminCap has key, store {
-        id: UID
+        id: UID,
+        /// Wormhole Core Bridge State Object ID
+        wormhole_state_id: Option<ID>,
+        /// Token Bridge State Object ID
+        token_bridge_state_id: Option<ID>,
+        /// Emitter capability for sending Wormhole messages from this contract
+        emitter_cap: Option<EmitterCap>, // Direct use of EmitterCap
+        /// TreasuryCap for minting/burning CarbonCreditToken
+        carbon_token_treasury: TreasuryCap<CarbonCreditToken>,
     }
 
     /// Shared object to prevent double-minting based on verification_id.
@@ -66,7 +86,7 @@ module rwa_platform::carbon_nft_manager {
         verification_id: vector<u8>,
     }
 
-    /// Emitted when a CarbonCreditNFT is retired (burned).
+    /// Emitted when a CarbonCreditNFT is retired (burned) locally.
     public struct RetireNFTEvent has copy, drop, store {
         retirer: address,
         nft_id: ID,
@@ -74,6 +94,7 @@ module rwa_platform::carbon_nft_manager {
         verification_id: vector<u8>,
     }
 
+    /// Emitted when a RetirementCertificate SBT is minted.
     public struct CertificateMinted has copy, drop, store {
         certificate_id: ID,
         retirer_address: address,
@@ -82,7 +103,8 @@ module rwa_platform::carbon_nft_manager {
         retirement_timestamp_ms: u64,
     }
 
-    // Inside carbon_nft_manager or a related module
+    /// Payload for bridging the value of a retired NFT to an ERC20 on EVM.
+    /// This is the custom payload included in the Wormhole Token Bridge message.
     public struct BridgeToErc20Payload has copy, drop, store {
         sui_nft_id: ID,
         amount_kg_co2e: u64,
@@ -93,23 +115,14 @@ module rwa_platform::carbon_nft_manager {
         target_evm_chain_id: u16, // Wormhole Chain ID of the target EVM chain
     }
 
-    // For signaling retirement (if you want to make this cross-chain)
-    public struct CrossChainRetirementPayload has copy, drop, store {
-        original_sui_nft_id: ID,
-        retirer_sui_address: address,
-        retired_amount_kg_co2e: u64,
-        original_verification_id: vector<u8>,
-        retirement_sui_timestamp_ms: u64,
-        target_evm_chain_id: u16,
-    }
-
-    public struct NFTPentToBridgeEvent has copy, drop, store {
+    /// Emitted when an NFT is retired for bridging, before the Wormhole message is published.
+    public struct NFTBridgingInitiated has copy, drop, store {
         sui_nft_id: ID,
+        sui_owner_address: address,
+        amount_kg_co2e: u64,
         target_chain_id: u16,
         evm_recipient_address: vector<u8>,
-        amount_kg_co2e: u64,
     }
-    // Emit this in `initiate_bridge_nft_to_erc20`
 
     // --- Getter Functions for CarbonCreditNFT ---
 
@@ -128,36 +141,87 @@ module rwa_platform::carbon_nft_manager {
         nft.verification_id
     }
 
+    // --- Error Constants ---
+
     /// Returned if the amount_kg_co2e provided for minting is zero.
     const EInvalidAmount: u64 = 1;
     /// Returned if trying to mint with a verification_id that has already been used.
     const EVerificationIdAlreadyProcessed: u64 = 2;
+    /// Returned if the CarbonCreditToken type is not registered with the Token Bridge.
+    const ECarbonTokenNotRegistered: u64 = 3;
+    /// Returned if the AdminCap is not initialized.
+    const EAdminCapNotInitialized: u64 = 5;
+
 
     /// Initializes the module: claims Publisher, creates AdminCap, and shares VerificationRegistry.
     /// Called once during module deployment/upgrade.
-    fun init(witness: CARBON_NFT_MANAGER, ctx: &mut TxContext) {
+    /// Requires the Wormhole and Token Bridge State Object IDs to be passed in.
+    fun init(
+        witness: CARBON_NFT_MANAGER,
+        ctx: &mut TxContext
+    ) {
         // 1. Claim the Publisher object using the one-time witness
         let publisher = package::claim(witness, ctx);
-        transfer::public_transfer(publisher, tx_context::sender(ctx));
+        public_transfer(publisher, sender(ctx));
 
-        // 2. Create and transfer AdminCap
-        let admin_cap = AdminCap { id: object::new(ctx) };
-        transfer::public_transfer(admin_cap, tx_context::sender(ctx));
+        // 2. Create the CarbonCreditToken currency
+        let (carbon_token_treasury, carbon_token_metadata) =
+            coin::create_currency<CarbonCreditToken>(
+                CarbonCreditToken {}, // Witness is an instance of CarbonCreditToken
+                0, 
+                b"CCT",
+                b"Carbon Credit Token",
+                b"Fungible token representing verified carbon credits.",
+                none(),
+                ctx
+            );
+        public_share_object(carbon_token_metadata);
 
-        // 3. Create and share the Verification Registry (for minting)
+        // 3. Create AdminCap (without bridge details initially)
+        let admin_cap = AdminCap {
+            id: new(ctx),
+            wormhole_state_id: none(),
+            token_bridge_state_id: none(),
+            emitter_cap: none(),
+            carbon_token_treasury: carbon_token_treasury,
+        };
+        public_transfer(admin_cap, sender(ctx));
+
+        // 4. Create and share the Verification Registry
         let verification_registry = VerificationRegistry {
-            id: object::new(ctx),
+            id: new(ctx),
             processed_ids: table::new<vector<u8>, bool>(ctx)
         };
-        transfer::share_object(verification_registry);
+        share_object(verification_registry);
+    }
+
+    /// Sets up the bridge-related fields in the AdminCap.
+    /// Should be called by the contract admin after initial deployment.
+    public entry fun setup_bridge_admin(
+        admin_cap: &mut AdminCap,
+        wormhole_state_id: ID,
+        token_bridge_state_id: ID,
+        _wormhole_state_for_emitter: &WormholeStateModule::State, // Use aliased module
+        _ctx: &mut TxContext
+    ) {
+        // Ensure this can only be called once or by an authorized party if needed
+        assert!(is_none(&admin_cap.wormhole_state_id), 1001); 
+        assert!(is_none(&admin_cap.token_bridge_state_id), 1001);
+        assert!(is_none(&admin_cap.emitter_cap), 1001);
+
+        let new_emitter_cap = wormhole::emitter::new(_wormhole_state_for_emitter, _ctx); 
+
+        fill(&mut admin_cap.emitter_cap, new_emitter_cap);
+        fill(&mut admin_cap.wormhole_state_id, wormhole_state_id);
+        fill(&mut admin_cap.token_bridge_state_id, token_bridge_state_id);
     }
 
     /// Creates and shares the Display object for CarbonCreditNFT.
     /// Must be called once by the package publisher after deployment.
-    #[allow(share_owned)] // Suppress warning as Display is newly created here
-    public entry fun create_display(publisher: &Publisher, ctx: &mut TxContext) {
+    #[allow(lint(share_owned))]
+    public entry fun create_nft_display(publisher: &Publisher, ctx: &mut TxContext) {
          // Create the Display object as mutable.
-        let mut display_obj = display::new<CarbonCreditNFT>(publisher, ctx); // Renamed to display_obj to avoid conflict with module
+        let mut display_obj = display::new<CarbonCreditNFT>(publisher, ctx);
 
         // Set collection-level metadata.
         let keys = vector[
@@ -176,7 +240,25 @@ module rwa_platform::carbon_nft_manager {
         display::update_version(&mut display_obj); // Increment version after changes
 
         // Share the display object publicly.
-        transfer::public_share_object(display_obj);
+        public_share_object(display_obj);
+    }
+
+    /// Creates and shares the Display object for RetirementCertificate.
+    /// Must be called once by the package publisher after deployment.
+    #[allow(lint(share_owned))]
+    public entry fun create_certificate_display(publisher: &Publisher, ctx: &mut TxContext) {
+        let mut display_obj = display::new<RetirementCertificate>(publisher, ctx);
+        let keys = vector[
+            string::utf8(b"name"),
+            string::utf8(b"description"),
+        ];
+        let values = vector[
+            string::utf8(b"Carbon Credit Retirement Certificate"),
+            string::utf8(b"Proof of retirement for a verified carbon credit NFT."),
+        ];
+        display::add_multiple(&mut display_obj, keys, values);
+        display::update_version(&mut display_obj);
+        public_share_object(display_obj);
     }
 
     /// Mints a new CarbonCreditNFT. Requires AdminCap authorization.
@@ -200,27 +282,28 @@ module rwa_platform::carbon_nft_manager {
 
         // 3. Create the NFT Object
         let nft = CarbonCreditNFT {
-            id: object::new(ctx),
+            id: new(ctx),
             amount_kg_co2e: amount_kg_co2e,
             activity_type: activity_type,
             verification_id: copy verification_id, // Store a copy in the NFT
-            issuance_timestamp_ms: tx_context::epoch_timestamp_ms(ctx),
+            issuance_timestamp_ms: epoch_timestamp_ms(ctx),
         };
 
         // 4. Emit Mint Event
         event::emit(MintNFTEvent {
-            nft_id: object::id(&nft), // Get the ID of the new NFT
+            nft_id: id(&nft), // Get the ID of the new NFT
             recipient: recipient,
             amount_kg_co2e: amount_kg_co2e,
             verification_id: verification_id, // verification_id was copied for table::add and nft.verification_id
         });
 
         // 5. Transfer NFT to Recipient
-        transfer::public_transfer(nft, recipient);
+        public_transfer(nft, recipient);
     }
 
     /// Retires (burns) a specific CarbonCreditNFT and issues a non-transferable
     /// RetirementCertificate SBT to the retirer. Called by the NFT owner.
+    /// This function is for *local* retirement only.
     public entry fun retire_nft(nft: CarbonCreditNFT, ctx: &mut TxContext) {
         // Object 'nft' is passed by value, consuming it.
 
@@ -233,8 +316,8 @@ module rwa_platform::carbon_nft_manager {
             issuance_timestamp_ms: _, // Timestamp not needed for event/cert, ignored
         } = nft; // 'nft' is consumed/destroyed here
 
-        let nft_id_value: ID = *object::uid_as_inner(&nft_uid_struct); // Get an owned copy of the ID
-        let retirer = tx_context::sender(ctx);
+        let nft_id_value: ID = *uid_as_inner(&nft_uid_struct); // Get an owned copy of the ID
+        let retirer = sender(ctx);
 
         // 2. Emit Retirement Event
         event::emit(RetireNFTEvent {
@@ -246,12 +329,12 @@ module rwa_platform::carbon_nft_manager {
 
         // 3. Explicitly delete the UID wrapper of the original NFT.
         // The fields were moved out, but the UID itself needs deletion.
-        object::delete(nft_uid_struct);
+        delete(nft_uid_struct);
 
         // ---- Mint the Retirement Certificate SBT ----
-        let retirement_timestamp = tx_context::epoch_timestamp_ms(ctx);
+        let retirement_timestamp = epoch_timestamp_ms(ctx);
         let certificate = RetirementCertificate {
-            id: object::new(ctx), // Create a new UID for the certificate
+            id: new(ctx), // Create a new UID for the certificate
             original_nft_id: nft_id_value,
             retirer_address: retirer,
             retired_amount_kg_co2e: amount_kg_co2e,
@@ -261,7 +344,7 @@ module rwa_platform::carbon_nft_manager {
 
         // Emit Certificate Minted Event
         event::emit(CertificateMinted {
-            certificate_id: object::id(&certificate),
+            certificate_id: id(&certificate),
             retirer_address: retirer,
             retired_amount_kg_co2e: amount_kg_co2e,
             original_verification_id: copy verification_id, // Copy for the event, original consumed by certificate
@@ -269,77 +352,107 @@ module rwa_platform::carbon_nft_manager {
         });
 
         // Transfer the SBT to the retirer
-        transfer::transfer(certificate, retirer);
+        transfer(certificate, retirer);
     }
 
     /// Function the *owner* of a certificate would call to freeze it.
     /// Takes ownership of the certificate object from the sender.
+    #[allow(lint(custom_state_change))]
     public entry fun freeze_my_certificate(certificate: RetirementCertificate, _ctx: &mut TxContext) {
         // The transaction sender must own the 'certificate' object being passed in.
-        transfer::freeze_object(certificate);
+        freeze_object(certificate);
     }
 
-    // (Assuming you have a way to get Wormhole Core Contract Object ID and necessary constants)
-    // Placeholder for Wormhole specific addresses and functions
-    // define these constants based on Wormhole's SUI deployment
-    // const WORMHOLE_CORE_BRIDGE_ADDRESS: address = @0x...; // Actual Wormhole Core Bridge address on SUI
-    // const WORMHOLE_PUBLISH_MESSAGE_FUNCTION_NAME: vector<u8> = b"publish_message";
-
-    public entry fun initiate_bridge_nft_to_erc20(
+    /// Initiates the process to bridge the value of a retired CarbonCreditNFT
+    /// to a fungible CarbonCreditToken on a target EVM chain via Wormhole.
+    /// This function consumes the NFT, mints the equivalent amount of
+    /// CarbonCreditToken, and sends it through the Wormhole Token Bridge
+    /// with a custom payload containing the NFT's details.
+    /// Called by the NFT owner.
+    public entry fun retire_and_bridge_nft(
         nft: CarbonCreditNFT, // Consumes the NFT
-        evm_recipient_address: vector<u8>, // Recipient on EVM
-        target_evm_chain_id: u16,    // Wormhole Chain ID for EVM chain
-        wormhole_fee_coin: sui::coin::Coin<sui::sui::SUI>, // For Wormhole message fee if any
+        admin_cap: &mut AdminCap, // Revert to &mut AdminCap for minting
+        wh_state: &mut WormholeStateModule::State, // Use aliased module
+        tb_state: &mut TokenBridgeStateModule::State, // Use aliased module
+        the_clock: &sui::clock::Clock, 
+        evm_recipient_address: vector<u8>, 
+        target_evm_chain_id: u16,    
+        wormhole_fee_coin: Coin<SUI>, 
         ctx: &mut TxContext
     ) {
-        let sender = tx_context::sender(ctx);
+        let sender = sender(ctx);
 
-        // 1. Extract data from the NFT
+        assert!(is_some(&admin_cap.emitter_cap), EAdminCapNotInitialized);
+
+        // 1. Extract data from the NFT and consume it
         let CarbonCreditNFT {
             id: nft_uid_struct,
             amount_kg_co2e,
             activity_type,
             verification_id,
-            issuance_timestamp_ms: _ // Consumed NFT's id
+            issuance_timestamp_ms: _
         } = nft;
-        let nft_id_value: ID = *object::uid_as_inner(&nft_uid_struct);
+        let nft_id_value: ID = *uid_as_inner(&nft_uid_struct);
+        delete(nft_uid_struct);
 
-        // (Optional) Lock the NFT in a vault instead of burning, if a return path is desired.
-        // For this example, we consume it by decomposing.
-        object::delete(nft_uid_struct); // Deleting the UID wrapper.
+        // 2. Mint CarbonCreditToken
+        let minted_balance = coin::mint_balance(&mut admin_cap.carbon_token_treasury, amount_kg_co2e);
 
-        // 2. Construct the payload
-        let payload = BridgeToErc20Payload {
+        // 3. Get VerifiedAsset info for CarbonCreditToken
+        let carbon_token_asset_info = TokenBridgeStateModule::verified_asset<CarbonCreditToken>(tb_state);
+        assert!(!token_bridge::token_registry::is_wrapped(&carbon_token_asset_info), ECarbonTokenNotRegistered);
+
+        // 4. Construct custom payload
+        let custom_payload = BridgeToErc20Payload {
             sui_nft_id: nft_id_value,
             amount_kg_co2e,
             activity_type,
-            original_verification_id: verification_id,
+            original_verification_id: copy verification_id,
             sui_owner_address: sender,
-            evm_recipient_address,
+            evm_recipient_address: copy evm_recipient_address,
             target_evm_chain_id,
         };
+        let serialized_custom_payload = sui::bcs::to_bytes(&custom_payload);
 
-        // 3. Serialize the payload (e.g., to BCS bytes)
-        let serialized_payload = sui::bcs::to_bytes(&payload);
+        // 5. Prepare Wormhole Token Bridge transfer
+        assert!(is_some(&admin_cap.emitter_cap), EAdminCapNotInitialized); // Ensure it's Some
+        let emitter_cap_ref: &EmitterCap = borrow(&admin_cap.emitter_cap); // Borrow the inner EmitterCap
 
-        // 4. Publish the message to Wormhole
-        // This is a simplified representation. You'll need to use the actual
-        // Wormhole SDK/module functions available on SUI.
-        // Example:
-        // wormhole_sui_module::publish_message(
-        //     WORMHOLE_CORE_BRIDGE_OBJECT_ID, // The shared object ID of Wormhole bridge
-        //     nonce, // A unique nonce for the message
-        //     serialized_payload,
-        //     consistency_level, // e.g., 1 for finalized
-        //     wormhole_fee_coin, // Pass the coin for fees
-        //     ctx
-        // );
-        // For now, we'll just emit an event as a placeholder for the actual Wormhole call
-        event::emit(payload); // Placeholder
+        let nonce = 0u32; // TODO: Implement robust nonce generation
 
-        // (Handle wormhole_fee_coin if not consumed by publish_message)
-        // if necessary, transfer fee coin back or to a treasury.
-        transfer::public_transfer(wormhole_fee_coin, sender);
+        let (transfer_ticket, dust_coin) = token_bridge::transfer_tokens_with_payload::prepare_transfer(
+            emitter_cap_ref, 
+            carbon_token_asset_info,
+            coin::from_balance(minted_balance, ctx),
+            target_evm_chain_id,
+            copy evm_recipient_address, 
+            serialized_custom_payload,
+            nonce 
+        );
+        coin::destroy_zero(dust_coin);
+
+        // 6. Publish Wormhole message via Token Bridge
+        let wh_message_ticket: MessageTicket = token_bridge::transfer_tokens_with_payload::transfer_tokens_with_payload(
+            tb_state,
+            transfer_ticket
+        );
+
+        // 7. Publish Wormhole message using the core bridge
+        publish_message( 
+            wh_state, 
+            wormhole_fee_coin,
+            wh_message_ticket, // Use the typed variable
+            the_clock 
+        );
+
+        // 8. Emit event
+        event::emit(NFTBridgingInitiated {
+            sui_nft_id: nft_id_value,
+            sui_owner_address: sender,
+            amount_kg_co2e,
+            target_chain_id: target_evm_chain_id,
+            evm_recipient_address,
+        });
     }
 
     #[test_only]
@@ -350,8 +463,20 @@ module rwa_platform::carbon_nft_manager {
 
     #[test_only]
     /// Creates an AdminCap for testing purposes.
-    public fun test_create_admin_cap(ctx: &mut TxContext): AdminCap {
-        AdminCap { id: object::new(ctx) }
+    public fun test_create_admin_cap(
+        wormhole_state_id: ID,
+        token_bridge_state_id: ID,
+        emitter_cap: EmitterCap, // Direct use of EmitterCap
+        carbon_token_treasury: TreasuryCap<CarbonCreditToken>,
+        ctx: &mut TxContext
+    ): AdminCap {
+        AdminCap {
+            id: new(ctx),
+            wormhole_state_id: some(wormhole_state_id),
+            token_bridge_state_id: some(token_bridge_state_id),
+            emitter_cap: some(emitter_cap),
+            carbon_token_treasury,
+        }
     }
 
     #[test_only]
@@ -359,11 +484,22 @@ module rwa_platform::carbon_nft_manager {
     /// Returns the ID of the shared registry.
     public fun test_create_and_share_registry(ctx: &mut TxContext): ID {
         let registry = VerificationRegistry {
-            id: object::new(ctx),
+            id: new(ctx),
             processed_ids: table::new<vector<u8>, bool>(ctx)
         };
-        let registry_id = object::id(&registry); // Get ID before sharing
-        transfer::public_share_object(registry); // Use public_share_object for shared objects with store
+        let registry_id = id(&registry); // Get ID before sharing
+        public_share_object(registry); // Use public_share_object for shared objects with store
         registry_id
+    }
+
+    #[test_only]
+    /// Helper to create a dummy CarbonCreditToken TreasuryCap for tests
+    public fun test_create_carbon_token_treasury(ctx: &mut TxContext): TreasuryCap<CarbonCreditToken> {
+        let (treasury, metadata) = coin::create_currency<CarbonCreditToken>(
+            CarbonCreditToken {}, 8, b"CCT", b"Carbon Credit Token", b"", none(), ctx
+        );
+        // In tests, we don't need to share metadata unless explicitly testing that.
+        sui::test_utils::destroy(metadata);
+        treasury
     }
 }

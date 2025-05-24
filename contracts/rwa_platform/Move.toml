@@ -1,3 +1,4 @@
+# File: Move.toml
 [package]
 name = "rwa_platform"
 edition = "2024.beta" # edition = "legacy" to use legacy (pre-2024) Move
@@ -5,32 +6,36 @@ edition = "2024.beta" # edition = "legacy" to use legacy (pre-2024) Move
 # authors = ["..."]      # e.g., ["Joe Smith (joesmith@noemail.com)", "John Snow (johnsnow@noemail.com)"]
 
 [dependencies]
+# Comment out local dependencies when publishing to a live network.
+# The compiler will use the [addresses] section to link against published packages.
+# Wormhole = { local = "./wormhole" }
+# TokenBridge = { local = "./token_bridge" }
 
-# For remote import, use the `{ git = "...", subdir = "...", rev = "..." }`.
-# Revision can be a branch, a tag, and a commit hash.
-# MyRemotePackage = { git = "https://some.remote/host.git", subdir = "remote/path", rev = "main" }
-
-# For local dependencies use `local = path`. Path is relative to the package root
-# Local = { local = "../path/to" }
-
-# To resolve a version conflict and force a specific version for dependency
+# To resolve a conflict and force a specific version for dependency
 # override use `override = true`
 # Override = { local = "../conflicting/version", override = true }
 
 [addresses]
 rwa_platform = "0x0"
-
-# Named addresses will be accessible in Move as `@name`. They're also exported:
-# for example, `std = "0x1"` is exported by the Standard Library.
-# alice = "0xA11CE"
+# These map the named addresses used in your Move code (wormhole, token_bridge)
+# to the actual deployed addresses on the network you are targeting (e.g., Testnet).
+# These are used when linking against a published package.
+# **IMPORTANT: VERIFY THESE ARE THE CORRECT OFFICIAL TESTNET ADDRESSES for Wormhole Core and Token Bridge.**
+# **AND THAT THE PACKAGE AT 'wormhole' EXPORTS AN 'emitter' MODULE.**
+wormhole = "0xf47329f4344f3bf0f8e436e2f7b485466cff300f12a166563995D3888c296a94" # Example/Old Testnet address - VERIFY
+token_bridge = "0x562760fc51d90d4ae1835bac3e91e0e6987d3497b06f066941d3e51f6e8d76d0" # Example/Old Testnet address - VERIFY
 
 [dev-dependencies]
-# The dev-dependencies section allows overriding dependencies for `--test` and
-# `--dev` modes. You can introduce test-only dependencies here.
-# Local = { local = "../path/to/dev-build" }
+# Use Git dependencies for dev/test builds as well
+# It's good practice to keep dev dependencies consistent with regular dependencies
+# Or use local paths for development:
+Wormhole = { local = "./wormhole" }
+TokenBridge = { local = "./token_bridge" }
 
 [dev-addresses]
 # The dev-addresses section allows overwriting named addresses for the `--test`
 # and `--dev` modes.
-# alice = "0xB0B"
-
+# wormhole and token_bridge should be resolved from [dev-dependencies] local paths for dev builds.
+# wormhole = "0x100"
+# token_bridge = "0x200"
+# rwa_platform = "0x20c"
