@@ -82,6 +82,35 @@ module rwa_platform::carbon_nft_manager {
         retirement_timestamp_ms: u64,
     }
 
+    // Inside carbon_nft_manager or a related module
+    public struct BridgeToErc20Payload has copy, drop, store {
+        sui_nft_id: ID,
+        amount_kg_co2e: u64,
+        activity_type: u8, // Keep if relevant for ERC20 representation
+        original_verification_id: vector<u8>,
+        sui_owner_address: address, // Original owner on SUI
+        evm_recipient_address: vector<u8>, // Target recipient on EVM (bytes for address)
+        target_evm_chain_id: u16, // Wormhole Chain ID of the target EVM chain
+    }
+
+    // For signaling retirement (if you want to make this cross-chain)
+    public struct CrossChainRetirementPayload has copy, drop, store {
+        original_sui_nft_id: ID,
+        retirer_sui_address: address,
+        retired_amount_kg_co2e: u64,
+        original_verification_id: vector<u8>,
+        retirement_sui_timestamp_ms: u64,
+        target_evm_chain_id: u16,
+    }
+
+    public struct NFTPentToBridgeEvent has copy, drop, store {
+        sui_nft_id: ID,
+        target_chain_id: u16,
+        evm_recipient_address: vector<u8>,
+        amount_kg_co2e: u64,
+    }
+    // Emit this in `initiate_bridge_nft_to_erc20`
+
     // --- Getter Functions for CarbonCreditNFT ---
 
     /// Returns the amount of CO2e in the NFT.
@@ -248,6 +277,68 @@ module rwa_platform::carbon_nft_manager {
     public entry fun freeze_my_certificate(certificate: RetirementCertificate, _ctx: &mut TxContext) {
         // The transaction sender must own the 'certificate' object being passed in.
         transfer::freeze_object(certificate);
+    }
+
+    // (Assuming you have a way to get Wormhole Core Contract Object ID and necessary constants)
+    // Placeholder for Wormhole specific addresses and functions
+    // define these constants based on Wormhole's SUI deployment
+    // const WORMHOLE_CORE_BRIDGE_ADDRESS: address = @0x...; // Actual Wormhole Core Bridge address on SUI
+    // const WORMHOLE_PUBLISH_MESSAGE_FUNCTION_NAME: vector<u8> = b"publish_message";
+
+    public entry fun initiate_bridge_nft_to_erc20(
+        nft: CarbonCreditNFT, // Consumes the NFT
+        evm_recipient_address: vector<u8>, // Recipient on EVM
+        target_evm_chain_id: u16,    // Wormhole Chain ID for EVM chain
+        wormhole_fee_coin: sui::coin::Coin<sui::sui::SUI>, // For Wormhole message fee if any
+        ctx: &mut TxContext
+    ) {
+        let sender = tx_context::sender(ctx);
+
+        // 1. Extract data from the NFT
+        let CarbonCreditNFT {
+            id: nft_uid_struct,
+            amount_kg_co2e,
+            activity_type,
+            verification_id,
+            issuance_timestamp_ms: _ // Consumed NFT's id
+        } = nft;
+        let nft_id_value: ID = *object::uid_as_inner(&nft_uid_struct);
+
+        // (Optional) Lock the NFT in a vault instead of burning, if a return path is desired.
+        // For this example, we consume it by decomposing.
+        object::delete(nft_uid_struct); // Deleting the UID wrapper.
+
+        // 2. Construct the payload
+        let payload = BridgeToErc20Payload {
+            sui_nft_id: nft_id_value,
+            amount_kg_co2e,
+            activity_type,
+            original_verification_id: verification_id,
+            sui_owner_address: sender,
+            evm_recipient_address,
+            target_evm_chain_id,
+        };
+
+        // 3. Serialize the payload (e.g., to BCS bytes)
+        let serialized_payload = sui::bcs::to_bytes(&payload);
+
+        // 4. Publish the message to Wormhole
+        // This is a simplified representation. You'll need to use the actual
+        // Wormhole SDK/module functions available on SUI.
+        // Example:
+        // wormhole_sui_module::publish_message(
+        //     WORMHOLE_CORE_BRIDGE_OBJECT_ID, // The shared object ID of Wormhole bridge
+        //     nonce, // A unique nonce for the message
+        //     serialized_payload,
+        //     consistency_level, // e.g., 1 for finalized
+        //     wormhole_fee_coin, // Pass the coin for fees
+        //     ctx
+        // );
+        // For now, we'll just emit an event as a placeholder for the actual Wormhole call
+        event::emit(payload); // Placeholder
+
+        // (Handle wormhole_fee_coin if not consumed by publish_message)
+        // if necessary, transfer fee coin back or to a treasury.
     }
 
     #[test_only]
