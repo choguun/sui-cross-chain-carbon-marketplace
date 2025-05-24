@@ -339,6 +339,7 @@ module rwa_platform::carbon_nft_manager {
 
         // (Handle wormhole_fee_coin if not consumed by publish_message)
         // if necessary, transfer fee coin back or to a treasury.
+        transfer::public_transfer(wormhole_fee_coin, sender);
     }
 
     #[test_only]
